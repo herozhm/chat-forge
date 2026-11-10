@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"strings"
+	"sync"
 	"time"
 
 	"gorm.io/gorm"
@@ -12,6 +13,10 @@ import (
 	"chat-forge-server/internal/provider"
 	"chat-forge-server/internal/tool"
 )
+
+// summaryMu 摘要压缩串行化:同一会话的并发 done 不重复触发压缩。
+// 进程级锁即可——摘要是非关键路径,多实例部署时应换 DB 行锁或分布式锁。
+var summaryMu sync.Mutex
 
 // Orchestrator 编排层:prompt 组装 → 调模型 → 工具循环 → 落库。
 // 失败语义:工具失败也结构化回喂模型(role=tool + error 内容),让模型自纠,
@@ -52,8 +57,8 @@ func (o *Orchestrator) Run(ctx context.Context, conv *model.Conversation, userTe
 		return
 	}
 
-	// 2. 组装历史(system + 近 N 条),控制上下文体积
-	history, err := o.buildMessages(conv.ID)
+	// 2. 组装历史(system + 会话摘要 + 原文窗口),控制上下文体积
+	history, err := o.buildMessages(conv)
 	if err != nil {
 		events <- errEvent("load history failed")
 		return
@@ -115,6 +120,8 @@ func (o *Orchestrator) Run(ctx context.Context, conv *model.Conversation, userTe
 				// 首轮对话后异步生成会话标题:用 Background ctx(请求 ctx 随响应结束被取消),
 				// 不阻塞 done 事件的返回——标题晚几秒出现在侧栏属可接受
 				go o.generateTitleIfDefault(conv.ID, userText)
+				// 窗口外有新增历史时,后台滚动压缩摘要,供下一轮注入(滞后一轮,不阻塞响应)
+				go o.updateSummaryIfStale(conv.ID)
 				events <- SSEEvent{Type: "done", Message: itoa(int(conv.ID))}
 				return
 			case "error":
@@ -134,6 +141,7 @@ func (o *Orchestrator) Run(ctx context.Context, conv *model.Conversation, userTe
 		if answer != "" {
 			_ = o.persistAssistant(conv.ID, answer)
 			go o.generateTitleIfDefault(conv.ID, userText)
+			go o.updateSummaryIfStale(conv.ID)
 			events <- SSEEvent{Type: "done", Message: itoa(int(conv.ID))}
 			return
 		}
@@ -145,20 +153,50 @@ func (o *Orchestrator) Run(ctx context.Context, conv *model.Conversation, userTe
 	events <- errEvent("tool loop exceeded max rounds")
 }
 
-// buildMessages 组装请求消息:system prompt + 最近 20 条历史。
-func (o *Orchestrator) buildMessages(convID uint) ([]provider.ChatMessage, error) {
+// 长对话上下文管理:原文窗口(条数与字符预算双重约束)+ 窗口外历史滚动摘要。
+// 窗口外内容不丢弃——由 updateSummaryIfStale 压成摘要,buildMessages 注入 system,
+// 把「硬失忆」变成「模糊记忆」。
+const (
+	recentKeepMax     = 16    // 原文窗口最大条数
+	contextCharBudget = 24000 // 原文窗口字符预算(中文 ≈ 1.2~1.6 万 token 的保守近似)
+	compressMinOffset = 4     // 窗口外至少攒够 N 条才压缩,避免频繁调用
+)
+
+const systemPrompt = "你是 chat-forge,一个乐于助人的中文 AI 助手。" +
+	"回答使用 Markdown;需要实时信息时调用提供的工具。"
+
+// buildMessages 组装请求消息:system prompt + 会话摘要 + 原文窗口。
+// 窗口取「最近 recentKeepMax 条」且「字符预算内」的双重约束;超预算即停,
+// 至少保留最新一条(防止单条超长消息导致窗口为空)。
+func (o *Orchestrator) buildMessages(conv *model.Conversation) ([]provider.ChatMessage, error) {
 	var msgs []model.Message
-	if err := o.DB.Where("conversation_id = ?", convID).
-		Order("created_at DESC, id DESC").Limit(20).Find(&msgs).Error; err != nil {
+	if err := o.DB.Where("conversation_id = ?", conv.ID).
+		Order("created_at DESC, id DESC").Limit(recentKeepMax).Find(&msgs).Error; err != nil {
 		return nil, err
 	}
-	out := []provider.ChatMessage{{
-		Role: provider.RoleSystem,
-		Content: "你是 chat-forge,一个乐于助人的中文 AI 助手。" +
-			"回答使用 Markdown;需要实时信息时调用提供的工具。",
-	}}
-	for i := len(msgs) - 1; i >= 0; i-- {
-		m := msgs[i]
+
+	out := []provider.ChatMessage{{Role: provider.RoleSystem, Content: systemPrompt}}
+	if conv.Summary != "" {
+		// 摘要作为独立 system 消息紧跟主 prompt:主 prompt 前缀稳定,利于 Prompt Cache 命中
+		out = append(out, provider.ChatMessage{
+			Role:    provider.RoleSystem,
+			Content: "【此前对话摘要】(更早的对话已压缩,以下为其要点)\n" + conv.Summary,
+		})
+	}
+
+	// 字符预算内从新到旧装箱;预算优先于条数
+	used := 0
+	var kept []model.Message
+	for _, m := range msgs {
+		cost := len([]rune(m.Content))
+		if used > 0 && used+cost > contextCharBudget {
+			break
+		}
+		used += cost
+		kept = append(kept, m)
+	}
+	for i := len(kept) - 1; i >= 0; i-- {
+		m := kept[i]
 		switch m.Role {
 		case provider.RoleUser:
 			out = append(out, provider.ChatMessage{Role: m.Role, Content: m.Content})
@@ -296,6 +334,117 @@ func truncateTitle(s string, n int) string {
 		return string(runes[:n]) + "…"
 	}
 	return string(runes)
+}
+
+// updateSummaryIfStale 滚动压缩窗口外历史:把「窗口之前的消息 + 旧摘要」压成新摘要存库,
+// 供下一轮 buildMessages 注入。滞后一轮(后台执行),不阻塞当前响应。
+//
+// 触发与去重:仅当「窗口外新增消息数」超过 SummarizedCount(上次已覆盖的条数)才压缩,
+// 并用进程锁串行化——每个 done 都会触发本方法,靠这两个条件把调用压到真正必要时。
+// Mock provider 直接跳过:固定文案作为摘要会污染后续上下文。
+func (o *Orchestrator) updateSummaryIfStale(convID uint) {
+	if _, isMock := o.Provider.(*provider.MockProvider); isMock {
+		return
+	}
+
+	summaryMu.Lock()
+	defer summaryMu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	var conv model.Conversation
+	if err := o.DB.First(&conv, convID).Error; err != nil {
+		return
+	}
+
+	var total int64
+	if err := o.DB.Model(&model.Message{}).Where("conversation_id = ?", convID).Count(&total).Error; err != nil {
+		return
+	}
+	offset := int(total) - recentKeepMax // 窗口外消息条数
+	if offset < compressMinOffset || offset <= conv.SummarizedCount {
+		return // 攒不够一批,或上次摘要已覆盖到最新
+	}
+
+	var old []model.Message
+	if err := o.DB.Where("conversation_id = ?", convID).
+		Order("created_at ASC, id ASC").Limit(offset).Find(&old).Error; err != nil {
+		return
+	}
+
+	// 组装压缩输入:旧摘要 + 窗口外对话记录(跳过工具原始 JSON——噪声大、价值低)
+	var transcript strings.Builder
+	for _, m := range old {
+		content := strings.TrimSpace(m.Content)
+		if content == "" || m.Role == provider.RoleTool {
+			continue
+		}
+		transcript.WriteString(roleLabel(m.Role) + ": ")
+		transcript.WriteString(truncateRunes(content, 400))
+		transcript.WriteString("\n")
+	}
+	userContent := ""
+	if conv.Summary != "" {
+		userContent += "现有摘要(请在其基础上融合新对话):\n" + conv.Summary + "\n\n"
+	}
+	userContent += "新增对话记录:\n" + transcript.String()
+
+	newSummary := o.llmSummarize(ctx, userContent)
+	if newSummary == "" {
+		return
+	}
+	_ = o.DB.Model(&model.Conversation{}).Where("id = ?", convID).
+		Updates(map[string]any{"summary": newSummary, "summarized_count": offset}).Error
+}
+
+// llmSummarize 一次廉价调用压缩对话历史。
+func (o *Orchestrator) llmSummarize(ctx context.Context, userContent string) string {
+	stream, err := o.Provider.StreamChat(ctx, provider.ChatRequest{
+		Messages: []provider.ChatMessage{
+			{Role: provider.RoleSystem, Content: "你是对话摘要器。把提供的对话历史压缩成一段简洁摘要,必须保留:用户的目标、已做的决定、关键信息(名称/数字/参数)、未完成事项。不超过300字,直接输出摘要本身,不要任何前缀或解释。"},
+			{Role: provider.RoleUser, Content: userContent},
+		},
+	})
+	if err != nil {
+		return ""
+	}
+	var sb strings.Builder
+	for ev := range stream {
+		switch ev.Type {
+		case "delta":
+			sb.WriteString(ev.Content)
+		case "error":
+			return ""
+		}
+	}
+	s := strings.TrimSpace(sb.String())
+	runes := []rune(s)
+	if len(runes) > 800 {
+		runes = runes[:800]
+	}
+	return string(runes)
+}
+
+func roleLabel(role string) string {
+	switch role {
+	case provider.RoleUser:
+		return "用户"
+	case provider.RoleAssistant:
+		return "助手"
+	case provider.RoleTool:
+		return "工具"
+	}
+	return role
+}
+
+// truncateRunes 按 rune 截断(中文安全),无省略号后缀——用于摘要转写等拼接场景。
+func truncateRunes(s string, n int) string {
+	runes := []rune(s)
+	if len(runes) <= n {
+		return s
+	}
+	return string(runes[:n])
 }
 
 func itoa(n int) string {
