@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
+import { nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
 import { apiDelete, apiGet, apiPost, streamChat } from '../api/client';
 import { useAuthStore } from '../stores/auth';
 import type { ChatEvent, ChatMessage, Conversation, ToolCall } from '../api/types';
@@ -122,7 +122,9 @@ async function send(): Promise<void> {
   streaming.value = true;
 
   messages.value.push({ key: 'u' + Date.now(), role: 'user', content, status: 'done', toolCalls: [], toolResults: [] });
-  const a: ChatMessage = { key: 'a' + Date.now(), role: 'assistant', content: '', status: 'streaming', toolCalls: [], toolResults: [] };
+  // 助手消息必须是 reactive:后续 handleEvent 按 key 突变的是这个引用,
+  // 若推入原始对象,突变不经过代理、不会触发重渲染,气泡会冻在「输入中」状态
+  const a = reactive<ChatMessage>({ key: 'a' + Date.now(), role: 'assistant', content: '', status: 'streaming', toolCalls: [], toolResults: [] });
   messages.value.push(a);
   scrollToBottom();
 
