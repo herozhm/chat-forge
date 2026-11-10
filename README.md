@@ -106,6 +106,8 @@ cd server && go test ./... -timeout 120s
 
 `internal/chat/orchestrator_test.go` 端到端验证工具循环:用户提问 → 模型发起 tool_call → 服务端执行 → 结果落库 → 最终回答,并校验落库消息序列为 `user → assistant(tool_calls) → tool → assistant`。全程 Mock,CI 零依赖。
 
+另有**真模型冒烟测试**(`internal/provider/openai_smoke_test.go`):配置 Secrets(`OPENAI_API_KEY` / `OPENAI_BASE_URL` / `OPENAI_MODEL`)后,CI 在 push main 时跑真模型回归——覆盖「Mock 测不出的 wire 契约」:assistant tool_calls 回传形状与流式增量聚合(曾实测 DeepSeek 422,已固化为回归)。无 Secrets 自动跳过,开源用户零负担。
+
 ## 📋 API 摘要
 
 | 方法 | 路径 | 说明 |
@@ -121,7 +123,7 @@ cd server && go test ./... -timeout 120s
 - [ ] RAG:文档切片 + pgvector 检索,回答带引用来源
 - [ ] token 计量与每用户预算限流
 - [ ] 评测集:20 个固定问题的回归基线
-- [ ] 会话标题自动摘要
+- [x] 会话标题自动摘要(首轮后廉价 LLM 生成,Mock 降级截断)
 
 ## License
 
