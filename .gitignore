@@ -1,0 +1,14 @@
+# Go
+server/chat-forge-server
+server/chat-forge.db
+server/chat-forge.db-journal
+*.test
+
+# Node
+node_modules/
+web/dist/
+web/*.tsbuildinfo
+
+# Env & misc
+.env
+.DS_Store
