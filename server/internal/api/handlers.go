@@ -102,7 +102,7 @@ func (h *convHandler) create(c *gin.Context) {
 	_ = c.ShouldBindJSON(&req)
 	conv := model.Conversation{
 		UserID: auth.UserID(c),
-		Title:  firstNonEmpty(strings.TrimSpace(req.Title), "新会话"),
+		Title:  firstNonEmpty(strings.TrimSpace(req.Title), model.DefaultConversationTitle),
 	}
 	if err := h.db.Create(&conv).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"message": "create failed"})
