@@ -3,6 +3,8 @@ package chat
 import (
 	"context"
 	"encoding/json"
+	"strings"
+	"time"
 
 	"gorm.io/gorm"
 
@@ -110,6 +112,9 @@ func (o *Orchestrator) Run(ctx context.Context, conv *model.Conversation, userTe
 					events <- errEvent("persist answer failed")
 					return
 				}
+				// 首轮对话后异步生成会话标题:用 Background ctx(请求 ctx 随响应结束被取消),
+				// 不阻塞 done 事件的返回——标题晚几秒出现在侧栏属可接受
+				go o.generateTitleIfDefault(conv.ID, userText)
 				events <- SSEEvent{Type: "done", Message: itoa(int(conv.ID))}
 				return
 			case "error":
@@ -128,6 +133,7 @@ func (o *Orchestrator) Run(ctx context.Context, conv *model.Conversation, userTe
 		}
 		if answer != "" {
 			_ = o.persistAssistant(conv.ID, answer)
+			go o.generateTitleIfDefault(conv.ID, userText)
 			events <- SSEEvent{Type: "done", Message: itoa(int(conv.ID))}
 			return
 		}
@@ -211,6 +217,85 @@ func (o *Orchestrator) persistAssistantToolCalls(convID uint, calls []provider.T
 
 func errEvent(msg string) SSEEvent {
 	return SSEEvent{Type: "error", Message: msg}
+}
+
+// generateTitleIfDefault 首轮对话后为「仍叫缺省标题」的会话生成真实标题。
+// - 真模型:一次廉价 LLM 调用生成(不带工具,输出约束在 system prompt);
+// - Mock:降级为截断首条用户消息——既不烧一次假调用,标题也不会变成 mock 的固定文案。
+// 用 Background ctx(此时请求 ctx 已随响应结束取消)+ 超时兜底,失败静默(标题非关键路径)。
+func (o *Orchestrator) generateTitleIfDefault(convID uint, firstUserMsg string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	var conv model.Conversation
+	if err := o.DB.First(&conv, convID).Error; err != nil {
+		return
+	}
+	if conv.Title != model.DefaultConversationTitle {
+		return
+	}
+
+	title := ""
+	if _, isMock := o.Provider.(*provider.MockProvider); !isMock {
+		title = o.llmTitle(ctx, firstUserMsg)
+	}
+	if title == "" {
+		title = truncateTitle(firstUserMsg, 16)
+	}
+	if title == "" {
+		return
+	}
+	_ = o.DB.Model(&model.Conversation{}).Where("id = ?", convID).Update("title", title).Error
+}
+
+// llmTitle 一次非流式语义的标题生成(复用 StreamChat 接口,收集全文)。
+func (o *Orchestrator) llmTitle(ctx context.Context, userMsg string) string {
+	stream, err := o.Provider.StreamChat(ctx, provider.ChatRequest{
+		Messages: []provider.ChatMessage{
+			{Role: provider.RoleSystem, Content: "你是会话标题生成器。根据用户消息生成不超过16字的简短标题,直接输出标题本身:不要引号、句号、任何前缀或解释。"},
+			{Role: provider.RoleUser, Content: userMsg},
+		},
+	})
+	if err != nil {
+		return ""
+	}
+	var sb strings.Builder
+	for ev := range stream {
+		switch ev.Type {
+		case "delta":
+			sb.WriteString(ev.Content)
+		case "error":
+			return ""
+		}
+	}
+	return sanitizeTitle(sb.String())
+}
+
+// sanitizeTitle 清理 LLM 输出:压掉换行、剥引号与常见前缀,截断到 20 rune。
+func sanitizeTitle(s string) string {
+	s = strings.Join(strings.Fields(s), " ")
+	s = strings.Trim(s, "\"'“”‘’《》「」*.。 ")
+	s = strings.TrimPrefix(s, "标题：")
+	s = strings.TrimPrefix(s, "标题:")
+	if s == "" {
+		return ""
+	}
+	runes := []rune(s)
+	if len(runes) > 20 {
+		runes = runes[:20]
+	}
+	return string(runes)
+}
+
+func truncateTitle(s string, n int) string {
+	runes := []rune(strings.TrimSpace(s))
+	if len(runes) == 0 {
+		return ""
+	}
+	if len(runes) > n {
+		return string(runes[:n]) + "…"
+	}
+	return string(runes)
 }
 
 func itoa(n int) string {
