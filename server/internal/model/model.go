@@ -2,6 +2,9 @@ package model
 
 import "time"
 
+// DefaultConversationTitle 新会话缺省标题;首轮对话后由编排层异步生成真实标题替换。
+const DefaultConversationTitle = "新会话"
+
 // User 注册用户。
 type User struct {
 	ID        uint      `gorm:"primaryKey" json:"id"`
