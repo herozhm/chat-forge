@@ -15,11 +15,15 @@ type User struct {
 
 // Conversation 会话。
 type Conversation struct {
-	ID        uint      `gorm:"primaryKey" json:"id"`
-	UserID    uint      `gorm:"index" json:"user_id"`
-	Title     string    `gorm:"size:128" json:"title"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ID     uint   `gorm:"primaryKey" json:"id"`
+	UserID uint   `gorm:"index" json:"user_id"`
+	Title  string `gorm:"size:128" json:"title"`
+	// Summary 窗口外历史的滚动摘要:发给模型时注入 system,替代被硬截断的旧对话
+	Summary string `gorm:"type:text" json:"summary,omitempty"`
+	// SummarizedCount 已被摘要覆盖的消息条数;新增窗口外消息数超过它才触发重压缩
+	SummarizedCount int       `gorm:"default 0" json:"-"`
+	CreatedAt       time.Time `json:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at"`
 }
 
 // Message 消息。role: user / assistant / tool。
