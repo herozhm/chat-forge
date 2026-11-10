@@ -34,19 +34,61 @@ type openaiStreamChoice struct {
 	Delta struct {
 		Content   string `json:"content"`
 		ToolCalls []struct {
-			Index     int    `json:"index"`
-			ID        string `json:"id"`
-			Name      string `json:"name"`
-			Arguments string `json:"arguments"`
+			Index    int    `json:"index"`
+			ID       string `json:"id"`
+			Function struct {
+				Name      string `json:"name"`
+				Arguments string `json:"arguments"`
+			} `json:"function"`
 		} `json:"tool_calls"`
 	} `json:"delta"`
 	FinishReason string `json:"finish_reason"`
 }
 
+// wireMessage / wireToolCall:assistant 工具调用消息回传给模型时的 wire 形状。
+// OpenAI 协议要求 tool_calls 元素为 {id, type:"function", function:{name, arguments}}——
+// 内部的扁平 ToolCall(id/name/arguments)是流式聚合形状,直接序列化会被
+// DeepSeek/OpenAI 以「missing field type」类 422 拒掉(Mock 不上 wire,测不出这条契约)。
+type wireToolCallFunc struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
+}
+
+type wireToolCall struct {
+	ID       string           `json:"id"`
+	Type     string           `json:"type"`
+	Function wireToolCallFunc `json:"function"`
+}
+
+type wireMessage struct {
+	Role       string         `json:"role"`
+	Content    string         `json:"content,omitempty"`
+	ToolCalls  []wireToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string         `json:"tool_call_id,omitempty"`
+	Name       string         `json:"name,omitempty"`
+}
+
+// toWire 把内部 ChatMessage 转成 OpenAI wire 形状。
+func toWire(msgs []ChatMessage) []wireMessage {
+	out := make([]wireMessage, 0, len(msgs))
+	for _, m := range msgs {
+		wm := wireMessage{Role: m.Role, Content: m.Content, ToolCallID: m.ToolCallID, Name: m.Name}
+		for _, tc := range m.ToolCalls {
+			wm.ToolCalls = append(wm.ToolCalls, wireToolCall{
+				ID:       tc.ID,
+				Type:     "function",
+				Function: wireToolCallFunc{Name: tc.Name, Arguments: tc.Arguments},
+			})
+		}
+		out = append(out, wm)
+	}
+	return out
+}
+
 func (p *OpenAIProvider) StreamChat(ctx context.Context, req ChatRequest) (<-chan StreamEvent, error) {
 	body := map[string]any{
 		"model":    p.Model,
-		"messages": req.Messages,
+		"messages": toWire(req.Messages),
 		"stream":   true,
 	}
 	if len(req.Tools) > 0 {
@@ -129,10 +171,11 @@ func (p *OpenAIProvider) pump(body io.ReadCloser, events chan<- StreamEvent) {
 				if tc.ID != "" {
 					cur.ID = tc.ID
 				}
-				if tc.Name != "" {
-					cur.Name = tc.Name
+				// name/arguments 在流式增量里嵌套于 function 字段下
+				if tc.Function.Name != "" {
+					cur.Name = tc.Function.Name
 				}
-				cur.Arguments += tc.Arguments
+				cur.Arguments += tc.Function.Arguments
 			}
 			if choice.FinishReason == "tool_calls" {
 				events <- StreamEvent{Type: "tool_calls", ToolCalls: collectCalls(aggregated)}
