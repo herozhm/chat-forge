@@ -34,12 +34,13 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
           cache-dependency-path: web/package-lock.json
-      # 规避 npm 10.x「Exit handler never called」已知 bug:静默装坏依赖后 vue-tsc not found
+      # 规避 npm 10.8.x「Exit handler never called」已知 bug:静默装坏依赖后 vue-tsc not found;
+      # 固定 npm 11 大版本——兼容 node 22,且不踩 npm@latest(12.x 要求 node>=22.22)的引擎坑
       - name: Upgrade npm
-        run: npm install -g npm@latest
+        run: npm install -g npm@11
       - run: npm ci
       - name: 类型检查 + 打包
         run: npm run build
