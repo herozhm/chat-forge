@@ -25,6 +25,28 @@ jobs:
       - name: Test
         run: go test ./... -timeout 120s
 
+  # 真模型冒烟:把「Mock 测不出的 wire 契约」固化成回归(assistant tool_calls 回传形状、
+  # 流式增量 function 嵌套)。仅在 push main 时跑,PR 不注入 key;无 Secrets 时用例自跳过。
+  smoke:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: server
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache-dependency-path: server/go.sum
+      - name: 真模型冒烟(工具循环 wire 契约回归)
+        env:
+          SMOKE: '1'
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
+          OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
+        run: go test ./internal/provider/ -run TestOpenAIRealSmoke -timeout 120s -v
+
   web:
     runs-on: ubuntu-latest
     defaults:
